@@ -14,19 +14,20 @@ import (
 )
 
 const (
-	screenWidth        = 640
-	screenHeight       = 480
-	easOutFactor       = 0.05
-	beamRadius         = 5.0
-	beamSpeed          = 1000.0
-	ballRadius         = 30.0
-	bouncyBallRadius   = 50.0
-	beamCooldownFrames = 2 // Fire beam every 2 frames
+	screenWidth         = 640
+	screenHeight        = 480
+	easOutFactor        = 0.05
+	beamRadius          = 5.0
+	beamSpeed           = 1000.0
+	ballRadius          = 30.0
+	bouncyBallRadius    = 80.0
+	minBouncyBallRadius = 10.0
+	beamCooldownFrames  = 2 // Fire beam every 2 frames
 )
 
 var (
 	body                *cp.Body
-	bouncyBall          *cp.Body
+	bouncyBalls         []*BouncyBall
 	space               *cp.Space
 	drawer              *ebitencp.Drawer
 	isButtonDown        bool
@@ -39,8 +40,25 @@ type Beam struct {
 	shape *cp.Shape
 }
 
+type BouncyBall struct {
+	body     *cp.Body
+	shape    *cp.Shape
+	radius   float64
+	hitCount int
+}
+
 type Game struct {
 	debugui debugui.DebugUI
+}
+
+func randomDiagonalUpVelocity(num int, height float64) cp.Vector {
+	// Random X velocity: -0.5 to 0.5
+	vx := -150.0
+	vy := -200.0 + height
+	if num > 0 {
+		vx = 150.0
+	}
+	return cp.Vector{X: vx, Y: vy}
 }
 
 func (g *Game) Update() error {
@@ -98,28 +116,42 @@ func (g *Game) Update() error {
 		}
 	}
 
-	// Remove off-screen beams and check collision with bouncyBall
+	// Check collisions between beams and bouncyBalls
 	remainingBeams := make([]*Beam, 0, len(beams))
-	bouncyBallPos := bouncyBall.Position()
+	ballsToSplit := make(map[int]bool) // Track which balls need to split
+
 	for _, beam := range beams {
-		pos := beam.body.Position()
-		shouldRemove := false
+		beamPos := beam.body.Position()
+		shouldRemoveBeam := false
 
-		// Check if beam is off-screen (with margin)
-		if math.Abs(pos.X) > screenWidth || math.Abs(pos.Y) > screenHeight {
-			shouldRemove = true
+		// Check if beam is off-screen
+		if math.Abs(beamPos.X) > screenWidth || math.Abs(beamPos.Y) > screenHeight {
+			shouldRemoveBeam = true
 		}
 
-		// Check collision with bouncyBall
-		dx := pos.X - bouncyBallPos.X
-		dy := pos.Y - bouncyBallPos.Y
-		distance := math.Sqrt(dx*dx + dy*dy)
-		if distance < bouncyBallRadius+beamRadius {
-			shouldRemove = true
+		// Check collision with all bouncyBalls
+		if !shouldRemoveBeam {
+			for i, ball := range bouncyBalls {
+				ballPos := ball.body.Position()
+				dx := beamPos.X - ballPos.X
+				dy := beamPos.Y - ballPos.Y
+				distance := math.Sqrt(dx*dx + dy*dy)
+
+				if distance < ball.radius+beamRadius {
+					// Collision detected
+					ball.hitCount++
+					shouldRemoveBeam = true
+
+					// Mark ball for splitting if hit 3 times
+					if ball.hitCount >= 10 {
+						ballsToSplit[i] = true
+					}
+					break
+				}
+			}
 		}
 
-		if shouldRemove {
-			// Remove from space
+		if shouldRemoveBeam {
 			space.RemoveShape(beam.shape)
 			space.RemoveBody(beam.body)
 		} else {
@@ -127,6 +159,32 @@ func (g *Game) Update() error {
 		}
 	}
 	beams = remainingBeams
+
+	// Process ball splits
+	remainingBalls := make([]*BouncyBall, 0, len(bouncyBalls))
+	for i, ball := range bouncyBalls {
+		if ballsToSplit[i] {
+			// Remove original ball
+			space.RemoveShape(ball.shape)
+			space.RemoveBody(ball.body)
+
+			// Split if large enough
+			newRadius := ball.radius / 2
+			if newRadius >= minBouncyBallRadius {
+				ballPos := ball.body.Position()
+				// Create two new balls
+				for j := 0; j < 2; j++ {
+					newBall := addBouncyBall(space, ballPos.X, ballPos.Y, newRadius)
+					vel := randomDiagonalUpVelocity(j, ballPos.Y)
+					newBall.body.SetVelocity(vel.X, vel.Y)
+					remainingBalls = append(remainingBalls, newBall)
+				}
+			}
+		} else {
+			remainingBalls = append(remainingBalls, ball)
+		}
+	}
+	bouncyBalls = remainingBalls
 
 	space.Step(1 / 60.0)
 	if _, err := g.debugui.Update(func(ctx *debugui.Context) error {
@@ -170,8 +228,9 @@ func main() {
 
 	addBall(space, -50, -180+ballRadius, ballRadius)
 	// Add larger bouncy ball with diagonal downward velocity
-	bouncyBall = addBouncyBall(space, 100, 100, bouncyBallRadius)
-	bouncyBall.SetVelocity(150, -200)
+	initialBouncyBall := addBouncyBall(space, 100, 100, bouncyBallRadius)
+	initialBouncyBall.body.SetVelocity(150, -200)
+	bouncyBalls = append(bouncyBalls, initialBouncyBall)
 
 	// Initialising Ebitengine/v2
 	game := &Game{}
@@ -184,6 +243,12 @@ func addWall(space *cp.Space, pos1 cp.Vector, pos2 cp.Vector, radius float64) {
 	shape := space.AddShape(cp.NewSegment(space.StaticBody, pos1, pos2, radius))
 	shape.SetElasticity(1.0)
 	shape.SetFriction(0.5)
+	// Set collision filter for walls
+	shape.SetFilter(cp.ShapeFilter{
+		Group:      0,
+		Categories: 0b1,    // wall category
+		Mask:       0xFFFF, // collide with everything
+	})
 }
 
 func addBall(space *cp.Space, x, y, radius float64) *cp.Body {
@@ -208,7 +273,7 @@ func addBall(space *cp.Space, x, y, radius float64) *cp.Body {
 	return body
 }
 
-func addBouncyBall(space *cp.Space, x, y, radius float64) *cp.Body {
+func addBouncyBall(space *cp.Space, x, y, radius float64) *BouncyBall {
 	// Use lighter mass for less gravity effect
 	mass := radius * radius / 500.0
 	ballBody := space.AddBody(
@@ -229,7 +294,19 @@ func addBouncyBall(space *cp.Space, x, y, radius float64) *cp.Body {
 	// Perfect elasticity for bouncing
 	shape.SetElasticity(1.0)
 	shape.SetFriction(0.1)
-	return ballBody
+	// Set collision filter to prevent bouncyBalls from colliding with each other
+	shape.SetFilter(cp.ShapeFilter{
+		Group:      0,
+		Categories: 0b100, // bouncyBall category
+		Mask:       0b1,   // only collide with walls (category 0b1)
+	})
+
+	return &BouncyBall{
+		body:     ballBody,
+		shape:    shape,
+		radius:   radius,
+		hitCount: 0,
+	}
 }
 
 func addBeam(space *cp.Space, x, y, vx, vy, radius float64) *Beam {
