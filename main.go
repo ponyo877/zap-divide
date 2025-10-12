@@ -20,11 +20,13 @@ const (
 	beamRadius         = 5.0
 	beamSpeed          = 1000.0
 	ballRadius         = 30.0
+	bouncyBallRadius   = 50.0
 	beamCooldownFrames = 2 // Fire beam every 2 frames
 )
 
 var (
 	body                *cp.Body
+	bouncyBall          *cp.Body
 	space               *cp.Space
 	drawer              *ebitencp.Drawer
 	isButtonDown        bool
@@ -96,12 +98,27 @@ func (g *Game) Update() error {
 		}
 	}
 
-	// Remove off-screen beams
+	// Remove off-screen beams and check collision with bouncyBall
 	remainingBeams := make([]*Beam, 0, len(beams))
+	bouncyBallPos := bouncyBall.Position()
 	for _, beam := range beams {
 		pos := beam.body.Position()
+		shouldRemove := false
+
 		// Check if beam is off-screen (with margin)
 		if math.Abs(pos.X) > screenWidth || math.Abs(pos.Y) > screenHeight {
+			shouldRemove = true
+		}
+
+		// Check collision with bouncyBall
+		dx := pos.X - bouncyBallPos.X
+		dy := pos.Y - bouncyBallPos.Y
+		distance := math.Sqrt(dx*dx + dy*dy)
+		if distance < bouncyBallRadius+beamRadius {
+			shouldRemove = true
+		}
+
+		if shouldRemove {
 			// Remove from space
 			space.RemoveShape(beam.shape)
 			space.RemoveBody(beam.body)
@@ -144,8 +161,17 @@ func main() {
 	// Initialising Chipmunk
 	space = cp.NewSpace()
 	space.SetGravity(cp.Vector{X: 0, Y: -100})
-	addWall(space, cp.Vector{X: -screenWidth / 2, Y: -200}, cp.Vector{X: screenWidth / 2, Y: -200}, 10)
-	addBall(space, -50, -200+ballRadius, ballRadius)
+	// Bottom wall
+	addWall(space, cp.Vector{X: -screenWidth / 2, Y: -screenHeight / 2}, cp.Vector{X: screenWidth / 2, Y: -screenHeight / 2}, 40)
+	// Left wall
+	addWall(space, cp.Vector{X: -screenWidth / 2, Y: -screenHeight / 2}, cp.Vector{X: -screenWidth / 2, Y: screenHeight / 2}, 40)
+	// Right wall
+	addWall(space, cp.Vector{X: screenWidth / 2, Y: -screenHeight / 2}, cp.Vector{X: screenWidth / 2, Y: screenHeight / 2}, 40)
+
+	addBall(space, -50, -180+ballRadius, ballRadius)
+	// Add larger bouncy ball with diagonal downward velocity
+	bouncyBall = addBouncyBall(space, 100, 100, bouncyBallRadius)
+	bouncyBall.SetVelocity(150, -200)
 
 	// Initialising Ebitengine/v2
 	game := &Game{}
@@ -156,7 +182,7 @@ func main() {
 
 func addWall(space *cp.Space, pos1 cp.Vector, pos2 cp.Vector, radius float64) {
 	shape := space.AddShape(cp.NewSegment(space.StaticBody, pos1, pos2, radius))
-	shape.SetElasticity(0)
+	shape.SetElasticity(1.0)
 	shape.SetFriction(0.5)
 }
 
@@ -182,6 +208,30 @@ func addBall(space *cp.Space, x, y, radius float64) *cp.Body {
 	return body
 }
 
+func addBouncyBall(space *cp.Space, x, y, radius float64) *cp.Body {
+	// Use lighter mass for less gravity effect
+	mass := radius * radius / 500.0
+	ballBody := space.AddBody(
+		cp.NewBody(
+			mass,
+			cp.MomentForCircle(mass, 0, radius, cp.Vector{}),
+		),
+	)
+	ballBody.SetPosition(cp.Vector{X: x, Y: y})
+
+	shape := space.AddShape(
+		cp.NewCircle(
+			ballBody,
+			radius,
+			cp.Vector{},
+		),
+	)
+	// Perfect elasticity for bouncing
+	shape.SetElasticity(1.0)
+	shape.SetFriction(0.1)
+	return ballBody
+}
+
 func addBeam(space *cp.Space, x, y, vx, vy, radius float64) *Beam {
 	// Use kinematic body to ignore gravity
 	beamBody := space.AddBody(cp.NewKinematicBody())
@@ -197,6 +247,12 @@ func addBeam(space *cp.Space, x, y, vx, vy, radius float64) *Beam {
 	)
 	shape.SetElasticity(0)
 	shape.SetFriction(0)
+	// Set collision filter to prevent beam from physically colliding
+	shape.SetFilter(cp.ShapeFilter{
+		Group:      0,
+		Categories: 0b10, // beam category
+		Mask:       0,    // don't collide with anything
+	})
 
 	return &Beam{
 		body:  beamBody,
