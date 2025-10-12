@@ -24,7 +24,14 @@ type Game struct{}
 
 func (g *Game) Update() error {
 	x, _ := ebiten.CursorPosition()
-	body.SetPosition(cp.Vector{X: float64(x) - screenWidth/2, Y: body.Position().Y})
+	targetX := float64(x) - screenWidth/2
+	currentX := body.Position().X
+
+	// Smooth lerp: move 15% closer to target each frame
+	lerpFactor := 0.1
+	newX := currentX + (targetX-currentX)*lerpFactor
+
+	body.SetPosition(cp.Vector{X: newX, Y: body.Position().Y})
 	space.Step(1 / 60.0)
 	return nil
 }
