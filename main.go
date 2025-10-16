@@ -3,11 +3,13 @@ package main
 import (
 	"image"
 	_ "image/png"
+	"log"
 	"math"
 
 	"github.com/demouth/ebitencp"
 	"github.com/ebitengine/debugui"
 	"github.com/hajimehoshi/ebiten/v2"
+	"github.com/hajimehoshi/ebiten/v2/ebitenutil"
 	"github.com/hajimehoshi/ebiten/v2/inpututil"
 
 	"github.com/jakecoffman/cp/v2"
@@ -16,13 +18,15 @@ import (
 const (
 	screenWidth         = 640
 	screenHeight        = 480
-	easOutFactor        = 0.05
+	easeOutFactor       = 0.025
 	beamRadius          = 5.0
 	beamSpeed           = 1000.0
 	ballRadius          = 30.0
 	bouncyBallRadius    = 80.0
 	minBouncyBallRadius = 10.0
-	beamCooldownFrames  = 2 // Fire beam every 2 frames
+	beamCooldownFrames  = 2   // Fire beam every 2 frames
+	playerScale         = 0.3 // Scale factor for player images
+	rotationOffset      = 0   // 90 degrees to fix orientation
 )
 
 var (
@@ -33,6 +37,16 @@ var (
 	isButtonDown        bool
 	beams               []*Beam
 	beamCooldownCounter int
+	headImg             *ebiten.Image
+	bodyImg1            *ebiten.Image
+	bodyImg2            *ebiten.Image
+	bodyImg3            *ebiten.Image
+	armImg              *ebiten.Image
+	currentAngle        float64
+	targetAngle         float64
+	smoothingFactor     = 0.15
+	accumulatedDistance float64
+	bodyCyclePattern    = []int{0, 1, 2, 1} // Cycle pattern for body images
 )
 
 type Beam struct {
@@ -51,6 +65,30 @@ type Game struct {
 	debugui debugui.DebugUI
 }
 
+func init() {
+	var err error
+	headImg, _, err = ebitenutil.NewImageFromFile("assets/頭部.png")
+	if err != nil {
+		log.Fatal(err)
+	}
+	bodyImg1, _, err = ebitenutil.NewImageFromFile("assets/胴体部1.png")
+	if err != nil {
+		log.Fatal(err)
+	}
+	bodyImg2, _, err = ebitenutil.NewImageFromFile("assets/胴体部2.png")
+	if err != nil {
+		log.Fatal(err)
+	}
+	bodyImg3, _, err = ebitenutil.NewImageFromFile("assets/胴体部3.png")
+	if err != nil {
+		log.Fatal(err)
+	}
+	armImg, _, err = ebitenutil.NewImageFromFile("assets/腕部+銃.png")
+	if err != nil {
+		log.Fatal(err)
+	}
+}
+
 func randomDiagonalUpVelocity(num int, height float64) cp.Vector {
 	// Random X velocity: -0.5 to 0.5
 	vx := -150.0
@@ -67,13 +105,37 @@ func (g *Game) Update() error {
 	targetX := float64(x) - screenWidth/2
 	currentPos := body.Position()
 
-	newX := currentPos.X + (targetX-currentPos.X)*easOutFactor
+	// Calculate target angle (mouse position relative to player)
+	mousePos := cp.Vector{
+		X: float64(x) - screenWidth/2,
+		Y: -(float64(y) - screenHeight/2), // Flip Y coordinate
+	}
+	dx := mousePos.X - currentPos.X
+	dy := mousePos.Y - currentPos.Y
+	targetAngle = -math.Atan2(dy, dx) // Negate to reverse rotation direction
+
+	// Normalize angle difference to [-π, π] for shortest rotation path
+	angleDiff := targetAngle - currentAngle
+	if angleDiff > math.Pi {
+		angleDiff -= 2 * math.Pi
+	} else if angleDiff < -math.Pi {
+		angleDiff += 2 * math.Pi
+	}
+
+	// Apply smoothing to current angle
+	currentAngle += angleDiff * smoothingFactor
+
+	newX := currentPos.X + (targetX-currentPos.X)*easeOutFactor
 	if newX < -screenWidth/2+ballRadius {
 		newX = -screenWidth/2 + ballRadius
 	}
 	if newX > screenWidth/2-ballRadius {
 		newX = screenWidth/2 - ballRadius
 	}
+
+	// Track accumulated movement distance for body animation
+	distanceMoved := math.Abs(newX - currentPos.X)
+	accumulatedDistance += distanceMoved
 
 	body.SetPosition(cp.Vector{X: newX, Y: body.Position().Y})
 
@@ -206,8 +268,120 @@ func (g *Game) Update() error {
 	return nil
 }
 
+func drawPlayer(screen *ebiten.Image) {
+	if body == nil {
+		return
+	}
+
+	pos := body.Position()
+	// Convert physics coordinates to screen coordinates
+	screenX := pos.X + screenWidth/2
+	screenY := screenHeight/2 - pos.Y
+
+	// Get image dimensions
+	bodyBounds := bodyImg1.Bounds()
+	bodyW := float64(bodyBounds.Dx())
+	bodyH := float64(bodyBounds.Dy())
+
+	headBounds := headImg.Bounds()
+	headW := float64(headBounds.Dx())
+	headH := float64(headBounds.Dy())
+
+	armBounds := armImg.Bounds()
+	armW := float64(armBounds.Dx())
+	armH := float64(armBounds.Dy())
+
+	// Shoulder pivot point (measured from arm image)
+	// Assuming shoulder is at approximately 1/5 from left and middle of height
+	shoulderPivotX := armW / 5
+	shoulderPivotY := armH / 2
+
+	// Head and arm offset (slightly above body)
+	headOffsetY := -150.0
+	armOffsetY := -75.0
+
+	// Determine drawing order based on angle
+	// Apply rotation offset to fix orientation
+	displayAngle := currentAngle + rotationOffset
+	// Check if facing left (left half of the circle)
+	isFacingLeft := displayAngle < -math.Pi/2 || displayAngle > math.Pi/2
+
+	drawBody := func() {
+		// Select body image based on accumulated distance
+		bodyImages := []*ebiten.Image{bodyImg1, bodyImg2, bodyImg3}
+		distancePerFrame := 20.0 // Distance threshold for changing frames
+		cycleIndex := int(accumulatedDistance/distancePerFrame) % len(bodyCyclePattern)
+		imageIndex := bodyCyclePattern[cycleIndex]
+		currentBodyImg := bodyImages[imageIndex]
+
+		// Draw body (no rotation)
+		bodyOp := &ebiten.DrawImageOptions{}
+		// 1. Pivot: move center to origin
+		bodyOp.GeoM.Translate(-bodyW/2, -bodyH/2)
+		// 2. Scale with flip if facing left
+		if isFacingLeft {
+			bodyOp.GeoM.Scale(-playerScale, playerScale)
+		} else {
+			bodyOp.GeoM.Scale(playerScale, playerScale)
+		}
+		// 3. Position
+		bodyOp.GeoM.Translate(screenX, screenY)
+		screen.DrawImage(currentBodyImg, bodyOp)
+	}
+
+	drawHead := func() {
+		// Draw head with rotation
+		headOp := &ebiten.DrawImageOptions{}
+		// 1. Pivot: move center to origin
+		headOp.GeoM.Translate(-headW/2, -headH/2)
+		// 2. Scale with flip if facing left
+		if isFacingLeft {
+			headOp.GeoM.Scale(-playerScale, playerScale)
+		} else {
+			headOp.GeoM.Scale(playerScale, playerScale)
+		}
+		// 3. Rotate with offset (reverse rotation and add 90 degrees when flipped)
+		if isFacingLeft {
+			headOp.GeoM.Rotate(displayAngle + math.Pi)
+		} else {
+			headOp.GeoM.Rotate(displayAngle)
+		}
+		// 4. Position: move to player position with offset
+		headOp.GeoM.Translate(screenX, screenY+headOffsetY*playerScale)
+		screen.DrawImage(headImg, headOp)
+	}
+
+	drawArm := func() {
+		// Draw arm with rotation (pivot at shoulder)
+		armOp := &ebiten.DrawImageOptions{}
+		// 1. Pivot: move shoulder to origin
+		armOp.GeoM.Translate(-shoulderPivotX, -shoulderPivotY)
+		// 2. Scale with flip if facing left
+		if isFacingLeft {
+			armOp.GeoM.Scale(-playerScale, playerScale)
+		} else {
+			armOp.GeoM.Scale(playerScale, playerScale)
+		}
+		// 3. Rotate with offset (reverse rotation and add 90 degrees when flipped)
+		if isFacingLeft {
+			armOp.GeoM.Rotate(displayAngle + math.Pi)
+		} else {
+			armOp.GeoM.Rotate(displayAngle)
+		}
+		// 4. Position: move to player position with offset
+		armOp.GeoM.Translate(screenX, screenY+armOffsetY*playerScale)
+		screen.DrawImage(armImg, armOp)
+	}
+
+	// Draw in fixed order: head -> arm -> body
+	drawBody()
+	drawHead()
+	drawArm()
+}
+
 func (g *Game) Draw(screen *ebiten.Image) {
 	cp.DrawSpace(space, drawer.WithScreen(screen))
+	drawPlayer(screen)
 	g.debugui.Draw(screen)
 }
 
@@ -226,7 +400,8 @@ func main() {
 	// Right wall
 	addWall(space, cp.Vector{X: screenWidth / 2, Y: -screenHeight / 2}, cp.Vector{X: screenWidth / 2, Y: screenHeight / 2}, 40)
 
-	addBall(space, -50, -180+ballRadius, ballRadius)
+	addBall(space, -50, -180+ballRadius, 10)
+	// addBall(space, -50, -180+ballRadius, ballRadius)
 	// Add larger bouncy ball with diagonal downward velocity
 	initialBouncyBall := addBouncyBall(space, 100, 100, bouncyBallRadius)
 	initialBouncyBall.body.SetVelocity(150, -200)
